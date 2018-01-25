@@ -1,21 +1,27 @@
 from airflow.hooks.S3_hook import S3Hook
-from airflow.models import BaseOperator
+from airflow.models import BaseOperator, SkipMixin
 
 from MarketoPlugin.hooks.marketo_hook import MarketoHook
-from MarketoPlugin.schemas import marketo_schema
+from MarketoPlugin.schemas._schema import schema
 
 import avro.schema
 from avro.datafile import DataFileWriter
 from avro.io import DatumWriter
 
-import json
-from time import sleep
 import boa
+import json
 import logging
+from tempfile import NamedTemporaryFile
+from time import sleep
+from csv import reader
 
 
-class MarketoToS3Operator(BaseOperator):
+class MarketoToS3Operator(BaseOperator, SkipMixin):
     """
+    NOTE: The only currently supported + tested output format is json.
+    There are references to avro in this code but support for that format
+    had to be delayed.
+
     Marketo to S3 Operator
     :param marketo_conn_id:         The Airflow connection id used to store
                                     the Marketo credentials.
@@ -35,6 +41,12 @@ class MarketoToS3Operator(BaseOperator):
                                     endpoints but leads.
     :type end_at:                   Isoformat timestamp
     :param payload:                 Payload variables -- all are optional
+    :param output_format:           The output format of the data. Possible
+                                    values include:
+                                        - json
+                                        - avro
+                                    Defaults to json.
+    :type output_format             string
     :param s3_conn_id:              The Airflow connection id used to store
                                     the S3 credentials.
     :type s3_conn_id:               string
@@ -57,6 +69,7 @@ class MarketoToS3Operator(BaseOperator):
                  s3_conn_id,
                  s3_bucket,
                  s3_key,
+                 output_format='json',
                  start_at=None,
                  end_at=None,
                  payload={},
@@ -64,10 +77,11 @@ class MarketoToS3Operator(BaseOperator):
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.marketo_conn_id = marketo_conn_id
-        self.endpoint = endpoint
+        self.endpoint = endpoint.lower()
         self.s3_conn_id = s3_conn_id
         self.s3_bucket = s3_bucket
         self.s3_key = s3_key
+        self.output_format = output_format.lower()
         self.start_at = start_at
         self.end_at = end_at
         self.payload = payload
@@ -80,6 +94,8 @@ class MarketoToS3Operator(BaseOperator):
 
             raise Exception('Specified endpoint not currently supported.')
 
+        if self.output_format not in ('json'):
+            raise Exception('Specified output format not currently supported.')
     def execute(self, context):
         self.token = (MarketoHook(http_conn_id=self.marketo_conn_id)
                       .run(self.methodMapper('auth'))
@@ -114,7 +130,6 @@ class MarketoToS3Operator(BaseOperator):
             job = post_hook.run(self.methodMapper('leads_create'),
                                 data=json.dumps(request),
                                 token=self.token).json()
-            print(job)
             export_id = [e['exportId'] for e in job['result']][0]
 
             status = [e['status'] for e in post_hook.run('bulk/v1/leads/export/{0}/enqueue.json'.format(export_id),
@@ -127,20 +142,39 @@ class MarketoToS3Operator(BaseOperator):
 
             output = get_hook.run('bulk/v1/leads/export/{0}/file.json'.format(export_id),
                                   token=self.token).text
+
             output = output.split('\n')
             headers = output.pop(0).split(',')
+            del output[0]
             headers = [boa.constrict(header) for header in headers]
-            output = [row.split(',') for row in output]
+            output = [row for row in reader(output)]
             output = [dict(zip(headers, row)) for row in output]
-            schema = getattr(marketo_schema, self.endpoint)
+            marketo_schema = schema[self.endpoint]
             field_names = []
-            for field in schema['fields']:
+            for field in marketo_schema['fields']:
                 field_names.append(field['name'])
-            print('DIFF: ' + str(set(headers) - set(field_names)))
+            logging.info('DIFF: ' + str(set(headers) - set(field_names)))
         else:
             output = self.paginate_data()
+            logging.info(len('Output Length: ' + str(output)))
 
-        self.outputManager(output, self.s3_key, self.s3_bucket)
+        if len(output) == 0 or output is None:
+            logging.info("No records pulled from Marketo.")
+            downstream_tasks = context['task'].get_flat_relatives(upstream=False)
+            logging.info('Skipping downstream tasks...')
+            logging.debug("Downstream task_ids %s", downstream_tasks)
+
+            if downstream_tasks:
+                self.skip(context['dag_run'],
+                          context['ti'].execution_date,
+                          downstream_tasks)
+
+            return True
+        else:
+            self.outputManager(self.nullify_output(output),
+                               self.s3_key,
+                               self.s3_bucket,
+                               self.output_format)
 
     def methodMapper(self, endpoint):
         """
@@ -215,22 +249,41 @@ class MarketoToS3Operator(BaseOperator):
             output = [{boa.constrict(k): v for k, v in i.items()} for i in output]
             return output
 
-    def outputManager(self, output, key, bucket):
-        schema = avro.schema.Parse(json.dumps(getattr(marketo_schema,
-                                                      self.endpoint)))
-        writer = DataFileWriter(open("{0}.avro".format(self.endpoint), "wb"),
-                                DatumWriter(),
-                                schema)
-        for record in output:
-            writer.append(record)
+    def outputManager(self, output, key, bucket, output_format='json'):
+        if output_format == 'avro':
+            avro_schema = avro.schema.Parse(json.dumps(schema[self.endpoint]))
+            writer = DataFileWriter(open("{0}.avro".format(self.endpoint), "wb"),
+                                    DatumWriter(),
+                                    avro_schema)
+            for record in output:
+                writer.append(record)
 
-        writer.close()
+            writer.close()
+
+            output_file = "{0}.avro".format(self.endpoint)
+
+        elif output_format == 'json':
+            tmp = NamedTemporaryFile("w")
+
+            for row in output:
+                tmp.write(json.dumps(row) + '\n')
+
+            tmp.flush()
+
+            output_file = tmp.name
 
         s3 = S3Hook(s3_conn_id=self.s3_conn_id)
 
         s3.load_file(
-            filename="{0}.avro".format(self.endpoint),
+            filename=output_file,
             key=self.s3_key,
             bucket_name=self.s3_bucket,
             replace=True
         )
+
+    def nullify_output(self, output):
+        for record in output:
+            for k, v in record.items():
+                if v == 'null':
+                    record[k] = None
+        return output
