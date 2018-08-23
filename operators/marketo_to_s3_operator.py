@@ -111,11 +111,15 @@ class MarketoToS3Operator(BaseOperator, SkipMixin):
         elif self.endpoint == 'leads':
             request = {}
             lead_fields = self.paginate_data(endpoint='lead_description')
-            request['fields'] = [record['rest']['name']
-                                 for record in lead_fields]
-            request['columnHeaderNames'] = {record['rest']['name']: record['rest']['name']
-                                            for record in lead_fields}
-
+            request['fields'] = []
+            for record in lead_fields:
+                try:
+                    request['fields'].append(record['rest']['name'])
+                except:
+                    pass
+                    
+            request['columnHeaderNames'] = {field : field for field in request['fields']}
+      
             request['filter'] = {}
             createdAt = {}
             createdAt['startAt'] = self.start_at
