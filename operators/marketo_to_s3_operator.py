@@ -47,9 +47,9 @@ class MarketoToS3Operator(BaseOperator, SkipMixin):
                                         - avro
                                     Defaults to json.
     :type output_format             string
-    :param s3_conn_id:              The Airflow connection id used to store
+    :param aws_conn_id:             The Airflow connection id used to store
                                     the S3 credentials.
-    :type s3_conn_id:               string
+    :type aws_conn_id:              string
     :param s3_bucket:               The S3 bucket to be used to store
                                     the Marketo data.
     :type s3_bucket:                string
@@ -66,7 +66,7 @@ class MarketoToS3Operator(BaseOperator, SkipMixin):
     def __init__(self,
                  marketo_conn_id,
                  endpoint,
-                 s3_conn_id,
+                 aws_conn_id,
                  s3_bucket,
                  s3_key,
                  output_format='json',
@@ -78,7 +78,7 @@ class MarketoToS3Operator(BaseOperator, SkipMixin):
         super().__init__(*args, **kwargs)
         self.marketo_conn_id = marketo_conn_id
         self.endpoint = endpoint.lower()
-        self.s3_conn_id = s3_conn_id
+        self.aws_conn_id = aws_conn_id
         self.s3_bucket = s3_bucket
         self.s3_key = s3_key
         self.output_format = output_format.lower()
@@ -276,7 +276,7 @@ class MarketoToS3Operator(BaseOperator, SkipMixin):
 
             output_file = tmp.name
 
-        s3 = S3Hook(s3_conn_id=self.s3_conn_id)
+        s3 = S3Hook(aws_conn_id=self.aws_conn_id)
 
         s3.load_file(
             filename=output_file,
